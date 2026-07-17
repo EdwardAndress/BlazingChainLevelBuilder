@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BLAZING CHAIN level builder</title>
+<style>
+  body{margin:0;background:#0d0f14;color:#f4f4f8;font-family:ui-monospace,Menlo,Consolas,monospace;
+    display:flex;gap:16px;padding:14px;align-items:flex-start;}
+  h2{font-size:12px;color:#ffe24a;margin:14px 0 6px;letter-spacing:1px;}
+  .hint{font-size:11px;color:#8b93b4;margin:4px 0;}
+  #left{width:640px;flex:none;}
+  canvas{image-rendering:pixelated;}
+  #sheetwrap{max-height:420px;overflow:auto;border:1px solid #454b63;background:#101318;}
+  #levelwrap{height:82vh;overflow:auto;border:2px solid #39c2ff;background:#101318;}
+  .row{display:flex;gap:8px;align-items:center;margin:6px 0;flex-wrap:wrap;}
+  input[type=number]{width:56px;background:#161a26;border:1px solid #454b63;color:#f4f4f8;
+    font-family:inherit;padding:4px;}
+  button{background:#161a26;border:1px solid #39c2ff;color:#f4f4f8;font-family:inherit;
+    padding:6px 10px;cursor:pointer;}
+  button:hover{background:#1e2436;}
+  button.on{background:#39c2ff;color:#0d0f14;}
+  label{font-size:11px;color:#8b93b4;}
+  textarea{width:620px;height:110px;background:#0a0c10;color:#9fd8ff;border:1px solid #454b63;
+    font-family:inherit;font-size:10px;}
+  #brushinfo{font-size:11px;color:#7ee08a;}
+</style>
+</head>
+<body>
+<div id="left">
+  <h2>1. TILESET</h2>
+  <div class="row">
+    <input type="file" id="file" accept="image/*">
+    <span class="hint">or drop an image anywhere on the page</span>
+  </div>
+  <div class="row">
+    <label>tile <input type="number" id="tw" value="32"> x <input type="number" id="th" value="32"></label>
+    <label>gutter <input type="number" id="gt" value="1"></label>
+    <label>offset <input type="number" id="ox" value="0"> , <input type="number" id="oy" value="0"></label>
+    <button id="auto">Auto-detect</button>
+  </div>
+  <p class="hint">Yellow overlay must sit on the tiles. Click a tile to select it;
+  drag across several to make a multi-tile stamp (for structures).</p>
+  <div id="sheetwrap"><canvas id="sheet"></canvas></div>
+  <div class="row"><span id="brushinfo">no brush</span></div>
+
+  <h2>2. EXPORT / IMPORT</h2>
+  <div class="row">
+    <button id="copy">Copy level JSON</button>
+    <button id="load">Load JSON below</button>
+    <button id="restore">Restore autosave</button>
+  </div>
+  <textarea id="io"></textarea>
+  <p class="hint">Paste the JSON back to Claude along with the tileset image.
+  Autosave uses browser storage when available.</p>
+</div>
+<div>
+  <h2>3. LEVEL &nbsp;<span class="hint">(row 0 = START at the bottom, boss at the top)</span></h2>
+  <div class="row">
+    <label>cols <input type="number" id="lc" value="8"></label>
+    <label>rows <input type="number" id="lr" value="96"></label>
+    <button id="resize">Resize</button>
+    <button id="paint" class="on">Paint</button>
+    <button id="erase">Erase</button>
+    <button id="fill">Fill empty with brush</button>
+    <button id="undo">Undo</button>
+  </div>
+  <p class="hint">Left drag paints the current brush. Right drag erases. Guides mark one screen (10 rows).</p>
+  <div id="levelwrap"><canvas id="level"></canvas></div>
+</div>
+<script>
+"use strict";
+const Z=2; // display zoom
+const $=id=>document.getElementById(id);
+const sheetCv=$('sheet'), sheetCx=sheetCv.getContext('2d');
+const levelCv=$('level'), levelCx=levelCv.getContext('2d');
+let img=null;
+let slice={tw:32,th:32,g:1,ox:0,oy:0,cols:0,rows:0};
+let level={cols:8,rows:96,cells:[]};
+let brush=null;           // {w,h,cells:[[idx]]}
+let mode='paint';
+let undoStack=[];
+let selAnchor=null, selRect=null;
+let hover=null, painting=false;
+
+function blank(cols,rows){ return Array.from({length:rows},()=>Array(cols).fill(null)); }
+level.cells=blank(level.cols,level.rows);
+
+// ---------- tileset loading ----------
+function loadFile(f){
+  const r=new FileReader();
+  r.onload=()=>{ const im=new Image(); im.onload=()=>{ img=im; autoDetect(); refit(); }; im.src=r.result; };
+  r.readAsDataURL(f);
+}
+$('file').addEventListener('change',e=>{ if(e.target.files[0]) loadFile(e.target.files[0]); });
+addEventListener('dragover',e=>e.preventDefault());
+addEventListener('drop',e=>{ e.preventDefault(); if(e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
+
+function readSlice(){
+  slice.tw=+$('tw').value||32; slice.th=+$('th').value||32;
+  slice.g=+$('gt').value||0; slice.ox=+$('ox').value||0; slice.oy=+$('oy').value||0;
+  if(img){
+    slice.cols=Math.max(0,Math.floor((img.width -slice.ox+slice.g)/(slice.tw+slice.g)));
+    slice.rows=Math.max(0,Math.floor((img.height-slice.oy+slice.g)/(slice.th+slice.g)));
+  }
+}
+['tw','th','gt','ox','oy'].forEach(id=>$(id).addEventListener('input',()=>{ readSlice(); drawSheet(); }));
+
+function autoDetect(){
+  if(!img) return;
+  const c=document.createElement('canvas'); c.width=img.width; c.height=img.height;
+  const g=c.getContext('2d'); g.drawImage(img,0,0);
+  const d=g.getImageData(0,0,img.width,img.height).data;
+  const W=img.width,H=img.height;
+  function colUniform(x){
+    const r0=d[(x)*4], g0=d[x*4+1], b0=d[x*4+2];
+    for(let y=7;y<H;y+=7){
+      const p=(y*W+x)*4;
+      if(Math.abs(d[p]-r0)>14||Math.abs(d[p+1]-g0)>14||Math.abs(d[p+2]-b0)>14) return false;
+    }
+    return true;
+  }
+  const seps=[]; for(let x=0;x<W;x++) if(colUniform(x)) seps.push(x);
+  let pitch=0;
+  const gaps={};
+  for(let i=1;i<seps.length;i++){ const gp=seps[i]-seps[i-1]; if(gp>8){ gaps[gp]=(gaps[gp]||0)+1; } }
+  let best=0;
+  for(const k in gaps) if(gaps[k]>best){ best=gaps[k]; pitch=+k; }
+  if(pitch>8){
+    $('tw').value=pitch-1; $('th').value=pitch-1; $('gt').value=1;
+    $('ox').value=seps.length&&seps[0]<pitch? (seps[0]+1)%pitch:0; $('oy').value=$('ox').value;
+  }
+  readSlice();
+  drawSheet();
+}
+$('auto').onclick=autoDetect;
+
+function refit(){ readSlice(); drawSheet(); }
+
+function tileSrc(i){
+  const c=i%slice.cols, r=(i/slice.cols)|0;
+  return [slice.ox+c*(slice.tw+slice.g), slice.oy+r*(slice.th+slice.g)];
+}
+function drawSheet(){
+  if(!img){ sheetCv.width=300; sheetCv.height=40;
+    sheetCx.fillStyle='#8b93b4'; sheetCx.fillText('load a tileset image',10,20); return; }
+  sheetCv.width=img.width*Z; sheetCv.height=img.height*Z;
+  sheetCx.imageSmoothingEnabled=false;
+  sheetCx.drawImage(img,0,0,img.width*Z,img.height*Z);
+  sheetCx.strokeStyle='rgba(255,226,74,.55)';
+  for(let r=0;r<slice.rows;r++)for(let c=0;c<slice.cols;c++){
+    sheetCx.strokeRect((slice.ox+c*(slice.tw+slice.g))*Z+0.5,(slice.oy+r*(slice.th+slice.g))*Z+0.5,
+      slice.tw*Z-1,slice.th*Z-1);
+  }
+  if(selRect){
+    sheetCx.strokeStyle='#39c2ff'; sheetCx.lineWidth=2;
+    const [c0,r0,c1,r1]=selRect;
+    const x=(slice.ox+c0*(slice.tw+slice.g))*Z, y=(slice.oy+r0*(slice.th+slice.g))*Z;
+    sheetCx.strokeRect(x,y,((c1-c0+1)*(slice.tw+slice.g)-slice.g)*Z,((r1-r0+1)*(slice.th+slice.g)-slice.g)*Z);
+    sheetCx.lineWidth=1;
+  }
+}
+function sheetCell(e){
+  const b=sheetCv.getBoundingClientRect();
+  const x=(e.clientX-b.left)/Z, y=(e.clientY-b.top)/Z;
+  const c=Math.floor((x-slice.ox)/(slice.tw+slice.g));
+  const r=Math.floor((y-slice.oy)/(slice.th+slice.g));
+  if(c<0||r<0||c>=slice.cols||r>=slice.rows) return null;
+  return [c,r];
+}
+sheetCv.addEventListener('pointerdown',e=>{
+  const c=sheetCell(e); if(!c) return;
+  selAnchor=c; selRect=[c[0],c[1],c[0],c[1]]; drawSheet();
+  e.preventDefault();
+});
+sheetCv.addEventListener('pointermove',e=>{
+  if(!selAnchor) return;
+  const c=sheetCell(e); if(!c) return;
+  selRect=[Math.min(selAnchor[0],c[0]),Math.min(selAnchor[1],c[1]),
+           Math.max(selAnchor[0],c[0]),Math.max(selAnchor[1],c[1])];
+  drawSheet();
+});
+addEventListener('pointerup',()=>{
+  if(selAnchor&&selRect){
+    const [c0,r0,c1,r1]=selRect;
+    brush={w:c1-c0+1,h:r1-r0+1,cells:[]};
+    for(let r=r0;r<=r1;r++){
+      const row=[]; for(let c=c0;c<=c1;c++) row.push(r*slice.cols+c);
+      brush.cells.push(row);
+    }
+    $('brushinfo').textContent='brush '+brush.w+'x'+brush.h+
+      (brush.w*brush.h===1?' (tile '+brush.cells[0][0]+')':'');
+  }
+  selAnchor=null;
+  painting=false;
+});
+
+// ---------- level editing ----------
+function drawLevel(){
+  const T=slice.tw*Z;
+  levelCv.width=level.cols*T; levelCv.height=level.rows*T;
+  levelCx.imageSmoothingEnabled=false;
+  levelCx.fillStyle='#101318'; levelCx.fillRect(0,0,levelCv.width,levelCv.height);
+  if(img){
+    for(let lr=0;lr<level.rows;lr++){
+      const dy=(level.rows-1-lr)*T;
+      for(let c=0;c<level.cols;c++){
+        const i=level.cells[lr][c];
+        if(i===null||i===undefined) continue;
+        const [sx,sy]=tileSrc(i);
+        levelCx.drawImage(img,sx,sy,slice.tw,slice.th,c*T,dy,T,T);
+      }
+    }
+  }
+  levelCx.strokeStyle='rgba(57,194,255,.12)';
+  for(let x=0;x<=level.cols;x++){ levelCx.beginPath(); levelCx.moveTo(x*T,0); levelCx.lineTo(x*T,levelCv.height); levelCx.stroke(); }
+  for(let y=0;y<=level.rows;y++){ levelCx.beginPath(); levelCx.moveTo(0,y*T); levelCx.lineTo(levelCv.width,y*T); levelCx.stroke(); }
+  levelCx.font='11px monospace';
+  for(let lr=0;lr<level.rows;lr+=10){
+    const dy=(level.rows-lr)*T;
+    levelCx.strokeStyle='rgba(255,226,74,.5)';
+    levelCx.beginPath(); levelCx.moveTo(0,dy); levelCx.lineTo(levelCv.width,dy); levelCx.stroke();
+    levelCx.fillStyle='#ffe24a';
+    levelCx.fillText(lr===0?'START':('screen '+(lr/10)),4,dy-4);
+  }
+  levelCx.fillStyle='#ff6b5e'; levelCx.fillText('BOSS END',4,12);
+  if(hover&&brush&&mode==='paint'){
+    levelCx.globalAlpha=0.55;
+    for(let bj=0;bj<brush.h;bj++)for(let bi=0;bi<brush.w;bi++){
+      const dx=(hover[0]+bi), dyr=(hover[1]+bj);
+      if(dx>=level.cols||dyr>=level.rows) continue;
+      const [sx,sy]=tileSrc(brush.cells[bj][bi]);
+      levelCx.drawImage(img,sx,sy,slice.tw,slice.th,dx*T,dyr*T,T,T);
+    }
+    levelCx.globalAlpha=1;
+  }
+}
+function levelCell(e){
+  const b=levelCv.getBoundingClientRect();
+  const T=slice.tw*Z;
+  const dx=Math.floor((e.clientX-b.left)/T), dy=Math.floor((e.clientY-b.top)/T);
+  if(dx<0||dy<0||dx>=level.cols||dy>=level.rows) return null;
+  return [dx,dy];
+}
+function snapshot(){ undoStack.push(level.cells.map(r=>r.slice())); if(undoStack.length>25) undoStack.shift(); }
+function applyAt(dx,dy,erase){
+  if(erase||!brush){
+    const lr=level.rows-1-dy;
+    if(level.cells[lr]) level.cells[lr][dx]=null;
+    return;
+  }
+  for(let bj=0;bj<brush.h;bj++)for(let bi=0;bi<brush.w;bi++){
+    const x=dx+bi, y=dy+bj;
+    if(x>=level.cols||y>=level.rows) continue;
+    const lr=level.rows-1-y;
+    level.cells[lr][x]=brush.cells[bj][bi];
+  }
+}
+levelCv.addEventListener('contextmenu',e=>e.preventDefault());
+levelCv.addEventListener('pointerdown',e=>{
+  const c=levelCell(e); if(!c) return;
+  snapshot(); painting=true;
+  applyAt(c[0],c[1], mode==='erase'||e.buttons===2);
+  drawLevel(); save();
+  e.preventDefault();
+});
+levelCv.addEventListener('pointermove',e=>{
+  const c=levelCell(e);
+  hover=c;
+  if(painting&&c){ applyAt(c[0],c[1], mode==='erase'||e.buttons===2); save(); }
+  requestAnimationFrame(drawLevel);
+});
+levelCv.style.touchAction='none';
+
+$('paint').onclick=()=>{ mode='paint'; $('paint').classList.add('on'); $('erase').classList.remove('on'); };
+$('erase').onclick=()=>{ mode='erase'; $('erase').classList.add('on'); $('paint').classList.remove('on'); };
+$('undo').onclick=()=>{ if(undoStack.length){ level.cells=undoStack.pop(); drawLevel(); save(); } };
+addEventListener('keydown',e=>{ if((e.ctrlKey||e.metaKey)&&e.key==='z'){ $('undo').onclick(); }});
+$('fill').onclick=()=>{
+  if(!brush) return;
+  snapshot();
+  for(let lr=0;lr<level.rows;lr++)for(let c=0;c<level.cols;c++){
+    if(level.cells[lr][c]===null){
+      const i=brush.cells[lr%brush.h][c%brush.w];
+      level.cells[lr][c]=i;
+    }
+  }
+  drawLevel(); save();
+};
+$('resize').onclick=()=>{
+  const nc=Math.max(1,+$('lc').value||8), nr=Math.max(1,+$('lr').value||96);
+  const nx=blank(nc,nr);
+  for(let r=0;r<Math.min(nr,level.rows);r++)
+    for(let c=0;c<Math.min(nc,level.cols);c++) nx[r][c]=level.cells[r][c];
+  level.cols=nc; level.rows=nr; level.cells=nx;
+  drawLevel(); save();
+};
+
+// ---------- export / import / autosave ----------
+function exportJSON(){
+  return JSON.stringify({format:'bc-level-1',
+    tile:{w:slice.tw,h:slice.th,gutter:slice.g,ox:slice.ox,oy:slice.oy},
+    sheetGrid:{cols:slice.cols,rows:slice.rows},
+    level:{cols:level.cols,rows:level.rows},
+    cells:level.cells});
+}
+function importJSON(s){
+  try{
+    const j=JSON.parse(s);
+    if(j.format!=='bc-level-1') throw 0;
+    $('tw').value=j.tile.w; $('th').value=j.tile.h; $('gt').value=j.tile.gutter;
+    $('ox').value=j.tile.ox; $('oy').value=j.tile.oy;
+    level.cols=j.level.cols; level.rows=j.level.rows; level.cells=j.cells;
+    $('lc').value=level.cols; $('lr').value=level.rows;
+    readSlice(); drawSheet(); drawLevel();
+  }catch(e){ alert('could not parse level JSON'); }
+}
+$('copy').onclick=()=>{
+  const s=exportJSON(); $('io').value=s; $('io').select();
+  try{ navigator.clipboard.writeText(s); }catch(e){ document.execCommand('copy'); }
+};
+$('load').onclick=()=>importJSON($('io').value);
+function save(){
+  try{ localStorage.setItem('bcLevelBuilder.autosave',exportJSON()); }catch(e){}
+}
+$('restore').onclick=()=>{
+  try{ const s=localStorage.getItem('bcLevelBuilder.autosave'); if(s) importJSON(s); }catch(e){}
+};
+
+readSlice(); drawSheet(); drawLevel();
+</script>
+</body>
+</html>
