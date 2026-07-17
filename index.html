@@ -38,6 +38,11 @@
     <label>gutter <input type="number" id="gt" value="1"></label>
     <label>offset <input type="number" id="ox" value="0"> , <input type="number" id="oy" value="0"></label>
     <button id="auto">Auto-detect</button>
+    <label>zoom <select id="zoom">
+      <option value="0">fit</option><option value="0.25">25%</option><option value="0.5">50%</option>
+      <option value="1">100%</option><option value="2">200%</option></select></label>
+    <label>game tile px <input type="number" id="tgt" value="32"></label>
+    <span class="hint" id="mode">uniform grid</span>
   </div>
   <p class="hint">Yellow overlay must sit on the tiles. Click a tile to select it;
   drag across several to make a multi-tile stamp (for structures).</p>
@@ -70,102 +75,162 @@
 </div>
 <script>
 "use strict";
-const Z=2; // display zoom
+const Z=2;
 const $=id=>document.getElementById(id);
 const sheetCv=$('sheet'), sheetCx=sheetCv.getContext('2d');
 const levelCv=$('level'), levelCx=levelCv.getContext('2d');
 let img=null;
-let slice={tw:32,th:32,g:1,ox:0,oy:0,cols:0,rows:0};
+let boundsX=[], boundsY=[];          // [[x0,x1],...] actual crop rects per grid col/row
+let gridMode='uniform';
+let sZ=1;                            // sheet display scale
 let level={cols:8,rows:96,cells:[]};
-let brush=null;           // {w,h,cells:[[idx]]}
-let mode='paint';
-let undoStack=[];
-let selAnchor=null, selRect=null;
-let hover=null, painting=false;
+let brush=null, mode='paint';
+let undoStack=[], selAnchor=null, selRect=null, hover=null, painting=false;
 
-function blank(cols,rows){ return Array.from({length:rows},()=>Array(cols).fill(null)); }
+function blank(c,r){ return Array.from({length:r},()=>Array(c).fill(null)); }
 level.cells=blank(level.cols,level.rows);
+const sliceCols=()=>boundsX.length, sliceRows=()=>boundsY.length;
+function target(){ return Math.max(8,+$('tgt').value||32); }
 
-// ---------- tileset loading ----------
+// ---------- loading ----------
 function loadFile(f){
   const r=new FileReader();
-  r.onload=()=>{ const im=new Image(); im.onload=()=>{ img=im; autoDetect(); refit(); }; im.src=r.result; };
+  r.onload=()=>{ const im=new Image(); im.onload=()=>{ img=im; autoDetect(); }; im.src=r.result; };
   r.readAsDataURL(f);
 }
 $('file').addEventListener('change',e=>{ if(e.target.files[0]) loadFile(e.target.files[0]); });
 addEventListener('dragover',e=>e.preventDefault());
 addEventListener('drop',e=>{ e.preventDefault(); if(e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
 
-function readSlice(){
-  slice.tw=+$('tw').value||32; slice.th=+$('th').value||32;
-  slice.g=+$('gt').value||0; slice.ox=+$('ox').value||0; slice.oy=+$('oy').value||0;
-  if(img){
-    slice.cols=Math.max(0,Math.floor((img.width -slice.ox+slice.g)/(slice.tw+slice.g)));
-    slice.rows=Math.max(0,Math.floor((img.height-slice.oy+slice.g)/(slice.th+slice.g)));
-  }
+// ---------- slicing ----------
+function uniformBounds(){
+  const tw=+$('tw').value||32, th=+$('th').value||32, g=+$('gt').value||0;
+  const ox=+$('ox').value||0, oy=+$('oy').value||0;
+  boundsX=[]; boundsY=[];
+  if(!img) return;
+  for(let x=ox; x+tw<=img.width; x+=tw+g) boundsX.push([x,x+tw-1]);
+  for(let y=oy; y+th<=img.height; y+=th+g) boundsY.push([y,y+th-1]);
+  gridMode='uniform'; $('mode').textContent='uniform grid';
 }
-['tw','th','gt','ox','oy'].forEach(id=>$(id).addEventListener('input',()=>{ readSlice(); drawSheet(); }));
+['tw','th','gt','ox','oy'].forEach(id=>$(id).addEventListener('input',()=>{ uniformBounds(); drawSheet(); }));
+$('tgt').addEventListener('input',()=>drawLevel());
 
 function autoDetect(){
-  if(!img) return;
+  if(!img){ return; }
   const c=document.createElement('canvas'); c.width=img.width; c.height=img.height;
   const g=c.getContext('2d'); g.drawImage(img,0,0);
   const d=g.getImageData(0,0,img.width,img.height).data;
-  const W=img.width,H=img.height;
-  function colUniform(x){
-    const r0=d[(x)*4], g0=d[x*4+1], b0=d[x*4+2];
-    for(let y=7;y<H;y+=7){
-      const p=(y*W+x)*4;
-      if(Math.abs(d[p]-r0)>14||Math.abs(d[p+1]-g0)>14||Math.abs(d[p+2]-b0)>14) return false;
+  const W=img.width, H=img.height;
+  const px=(x,y)=>{ const p=(y*W+x)*4; return [d[p],d[p+1],d[p+2]]; };
+  // gutter colour: modal frame colour
+  const cnt={};
+  for(let x=0;x<W;x+=7){ for(const y of [0,H-1]){ const k=px(x,y).join(','); cnt[k]=(cnt[k]||0)+1; } }
+  for(let y=0;y<H;y+=7){ for(const x of [0,W-1]){ const k=px(x,y).join(','); cnt[k]=(cnt[k]||0)+1; } }
+  let bg=[0,0,0], best=0;
+  for(const k in cnt) if(cnt[k]>best){ best=cnt[k]; bg=k.split(',').map(Number); }
+  const isbg=(x,y)=>{ const p=px(x,y);
+    return Math.abs(p[0]-bg[0])<16&&Math.abs(p[1]-bg[1])<16&&Math.abs(p[2]-bg[2])<16; };
+  function gutters(limit,other,vert){
+    const out=[];
+    for(let i=0;i<limit;i++){
+      let ok=0,n=0;
+      for(let j=0;j<other;j+=9){ n++; if(vert?isbg(i,j):isbg(j,i)) ok++; }
+      if(ok>=n*0.92) out.push(i);
     }
-    return true;
+    return out;
   }
-  const seps=[]; for(let x=0;x<W;x++) if(colUniform(x)) seps.push(x);
-  let pitch=0;
-  const gaps={};
-  for(let i=1;i<seps.length;i++){ const gp=seps[i]-seps[i-1]; if(gp>8){ gaps[gp]=(gaps[gp]||0)+1; } }
-  let best=0;
-  for(const k in gaps) if(gaps[k]>best){ best=gaps[k]; pitch=+k; }
-  if(pitch>8){
-    $('tw').value=pitch-1; $('th').value=pitch-1; $('gt').value=1;
-    $('ox').value=seps.length&&seps[0]<pitch? (seps[0]+1)%pitch:0; $('oy').value=$('ox').value;
+  function runsToBands(idx,limit){
+    const bands=[]; let prev=0;
+    let s=null,p=null; const rn=[];
+    for(const i of idx){ if(s===null){s=p=i;} else if(i===p+1){p=i;} else {rn.push([s,p]); s=p=i;} }
+    if(s!==null) rn.push([s,p]);
+    for(const [a,b] of rn){ if(a>prev) bands.push([prev,a-1]); prev=b+1; }
+    if(prev<limit) bands.push([prev,limit-1]);
+    return bands.filter(b=>b[1]-b[0]>4);
   }
-  readSlice();
-  drawSheet();
+  const gx=gutters(W,H,true), gy=gutters(H,W,false);
+  if(gx.length<2||gy.length<2){ uniformBounds(); drawSheet(); fitZoom(); return; }
+  const bx=runsToBands(gx,W), by=runsToBands(gy,H);
+  function bestUnit(bands){
+    const ws=bands.map(b=>b[1]-b[0]+1);
+    const cands=new Set();
+    for(const w of ws) for(let k=1;k<=4;k++){
+      const u=Math.round(w/k); if(u>=24) cands.add(u);
+    }
+    let bu=Math.max(...ws), bc=-1;
+    for(const u of cands){
+      let count=0;
+      for(const w of ws){
+        for(let n=1;n<=6;n++){
+          if(Math.abs(w-n*u)/w<=0.08){ count++; break; }
+        }
+      }
+      if(count>bc||(count===bc&&u>bu)){ bc=count; bu=u; }
+    }
+    return bu;
+  }
+  function splitBands(bands){
+    const unit=bestUnit(bands);
+    const out=[];
+    for(const [a,b] of bands){
+      const w=b-a+1, n=Math.max(1,Math.round(w/unit));
+      for(let k=0;k<n;k++) out.push([a+Math.floor(k*w/n), a+Math.floor((k+1)*w/n)-1]);
+    }
+    return out;
+  }
+  boundsX=splitBands(bx); boundsY=splitBands(by);
+  // uniform if all cells same size: report either way
+  const ws=new Set(boundsX.map(b=>b[1]-b[0]+1)), hs=new Set(boundsY.map(b=>b[1]-b[0]+1));
+  if(ws.size===1&&hs.size===1&&bx.length===boundsX.length&&by.length===boundsY.length){
+    gridMode='uniform';
+    $('tw').value=[...ws][0]; $('th').value=[...hs][0];
+    $('gt').value=boundsX.length>1?(boundsX[1][0]-boundsX[0][1]-1):0;
+    $('ox').value=boundsX[0][0]; $('oy').value=boundsY[0][0];
+    $('mode').textContent='uniform grid';
+  } else {
+    gridMode='bands';
+    $('mode').textContent='irregular bands ('+boundsX.length+'x'+boundsY.length+' cells)'+
+      ((boundsX.length>48||boundsY.length>24)?' CHECK SLICING':'');
+  }
+  drawSheet(); fitZoom();
 }
 $('auto').onclick=autoDetect;
 
-function refit(){ readSlice(); drawSheet(); }
-
-function tileSrc(i){
-  const c=i%slice.cols, r=(i/slice.cols)|0;
-  return [slice.ox+c*(slice.tw+slice.g), slice.oy+r*(slice.th+slice.g)];
+// ---------- sheet view ----------
+function fitZoom(){
+  if(!img) return;
+  const sel=$('zoom').value;
+  if(sel==='0'){ sZ=Math.min(2,620/img.width); }
+  else sZ=+sel;
+  drawSheet();
 }
+$('zoom').addEventListener('change',fitZoom);
+
 function drawSheet(){
   if(!img){ sheetCv.width=300; sheetCv.height=40;
     sheetCx.fillStyle='#8b93b4'; sheetCx.fillText('load a tileset image',10,20); return; }
-  sheetCv.width=img.width*Z; sheetCv.height=img.height*Z;
-  sheetCx.imageSmoothingEnabled=false;
-  sheetCx.drawImage(img,0,0,img.width*Z,img.height*Z);
+  sheetCv.width=Math.max(1,img.width*sZ|0); sheetCv.height=Math.max(1,img.height*sZ|0);
+  sheetCx.imageSmoothingEnabled=sZ>=1?false:true;
+  sheetCx.drawImage(img,0,0,sheetCv.width,sheetCv.height);
   sheetCx.strokeStyle='rgba(255,226,74,.55)';
-  for(let r=0;r<slice.rows;r++)for(let c=0;c<slice.cols;c++){
-    sheetCx.strokeRect((slice.ox+c*(slice.tw+slice.g))*Z+0.5,(slice.oy+r*(slice.th+slice.g))*Z+0.5,
-      slice.tw*Z-1,slice.th*Z-1);
-  }
+  for(const [y0,y1] of boundsY) for(const [x0,x1] of boundsX)
+    sheetCx.strokeRect(x0*sZ+0.5,y0*sZ+0.5,(x1-x0+1)*sZ-1,(y1-y0+1)*sZ-1);
   if(selRect){
     sheetCx.strokeStyle='#39c2ff'; sheetCx.lineWidth=2;
     const [c0,r0,c1,r1]=selRect;
-    const x=(slice.ox+c0*(slice.tw+slice.g))*Z, y=(slice.oy+r0*(slice.th+slice.g))*Z;
-    sheetCx.strokeRect(x,y,((c1-c0+1)*(slice.tw+slice.g)-slice.g)*Z,((r1-r0+1)*(slice.th+slice.g)-slice.g)*Z);
+    const x0=boundsX[c0][0], y0=boundsY[r0][0];
+    const x1=boundsX[c1][1], y1=boundsY[r1][1];
+    sheetCx.strokeRect(x0*sZ,y0*sZ,(x1-x0+1)*sZ,(y1-y0+1)*sZ);
     sheetCx.lineWidth=1;
   }
 }
 function sheetCell(e){
   const b=sheetCv.getBoundingClientRect();
-  const x=(e.clientX-b.left)/Z, y=(e.clientY-b.top)/Z;
-  const c=Math.floor((x-slice.ox)/(slice.tw+slice.g));
-  const r=Math.floor((y-slice.oy)/(slice.th+slice.g));
-  if(c<0||r<0||c>=slice.cols||r>=slice.rows) return null;
+  const x=(e.clientX-b.left)/sZ, y=(e.clientY-b.top)/sZ;
+  let c=-1,r=-1;
+  boundsX.forEach(([a,z],i)=>{ if(x>=a&&x<=z) c=i; });
+  boundsY.forEach(([a,z],i)=>{ if(y>=a&&y<=z) r=i; });
+  if(c<0||r<0) return null;
   return [c,r];
 }
 sheetCv.addEventListener('pointerdown',e=>{
@@ -185,60 +250,66 @@ addEventListener('pointerup',()=>{
     const [c0,r0,c1,r1]=selRect;
     brush={w:c1-c0+1,h:r1-r0+1,cells:[]};
     for(let r=r0;r<=r1;r++){
-      const row=[]; for(let c=c0;c<=c1;c++) row.push(r*slice.cols+c);
+      const row=[]; for(let c=c0;c<=c1;c++) row.push(r*sliceCols()+c);
       brush.cells.push(row);
     }
     $('brushinfo').textContent='brush '+brush.w+'x'+brush.h+
       (brush.w*brush.h===1?' (tile '+brush.cells[0][0]+')':'');
   }
-  selAnchor=null;
-  painting=false;
+  selAnchor=null; painting=false;
 });
 
-// ---------- level editing ----------
+// ---------- level ----------
+function tileRect(i){
+  const c=i%sliceCols(), r=(i/sliceCols())|0;
+  const [x0,x1]=boundsX[c], [y0,y1]=boundsY[r];
+  return [x0,y0,x1-x0+1,y1-y0+1];
+}
 function drawLevel(){
-  const T=slice.tw*Z;
-  levelCv.width=level.cols*T; levelCv.height=level.rows*T;
+  const CS=cellSize();
+  levelCv.width=level.cols*CS; levelCv.height=level.rows*CS;
   levelCx.imageSmoothingEnabled=false;
   levelCx.fillStyle='#101318'; levelCx.fillRect(0,0,levelCv.width,levelCv.height);
-  if(img){
+  if(img&&boundsX.length){
     for(let lr=0;lr<level.rows;lr++){
-      const dy=(level.rows-1-lr)*T;
+      const dy=(level.rows-1-lr)*CS;
       for(let c=0;c<level.cols;c++){
         const i=level.cells[lr][c];
         if(i===null||i===undefined) continue;
-        const [sx,sy]=tileSrc(i);
-        levelCx.drawImage(img,sx,sy,slice.tw,slice.th,c*T,dy,T,T);
+        const [sx,sy,sw,sh]=tileRect(i);
+        levelCx.drawImage(img,sx,sy,sw,sh,c*CS,dy,CS,CS);
       }
     }
   }
   levelCx.strokeStyle='rgba(57,194,255,.12)';
-  for(let x=0;x<=level.cols;x++){ levelCx.beginPath(); levelCx.moveTo(x*T,0); levelCx.lineTo(x*T,levelCv.height); levelCx.stroke(); }
-  for(let y=0;y<=level.rows;y++){ levelCx.beginPath(); levelCx.moveTo(0,y*T); levelCx.lineTo(levelCv.width,y*T); levelCx.stroke(); }
+  for(let x=0;x<=level.cols;x++){ levelCx.beginPath(); levelCx.moveTo(x*CS,0); levelCx.lineTo(x*CS,levelCv.height); levelCx.stroke(); }
+  for(let y=0;y<=level.rows;y++){ levelCx.beginPath(); levelCx.moveTo(0,y*CS); levelCx.lineTo(levelCv.width,y*CS); levelCx.stroke(); }
   levelCx.font='11px monospace';
-  for(let lr=0;lr<level.rows;lr+=10){
-    const dy=(level.rows-lr)*T;
+  const perScreen=Math.max(1,Math.round(320/target()));
+  for(let lr=0;lr<level.rows;lr+=perScreen){
+    const dy=(level.rows-lr)*CS;
     levelCx.strokeStyle='rgba(255,226,74,.5)';
     levelCx.beginPath(); levelCx.moveTo(0,dy); levelCx.lineTo(levelCv.width,dy); levelCx.stroke();
     levelCx.fillStyle='#ffe24a';
-    levelCx.fillText(lr===0?'START':('screen '+(lr/10)),4,dy-4);
+    levelCx.fillText(lr===0?'START':('screen '+(lr/perScreen)),4,dy-4);
   }
   levelCx.fillStyle='#ff6b5e'; levelCx.fillText('BOSS END',4,12);
-  if(hover&&brush&&mode==='paint'){
+  if(hover&&brush&&mode==='paint'&&img){
     levelCx.globalAlpha=0.55;
     for(let bj=0;bj<brush.h;bj++)for(let bi=0;bi<brush.w;bi++){
-      const dx=(hover[0]+bi), dyr=(hover[1]+bj);
+      const dx=hover[0]+bi, dyr=hover[1]+bj;
       if(dx>=level.cols||dyr>=level.rows) continue;
-      const [sx,sy]=tileSrc(brush.cells[bj][bi]);
-      levelCx.drawImage(img,sx,sy,slice.tw,slice.th,dx*T,dyr*T,T,T);
+      const [sx,sy,sw,sh]=tileRect(brush.cells[bj][bi]);
+      levelCx.drawImage(img,sx,sy,sw,sh,dx*CS,dyr*CS,CS,CS);
     }
     levelCx.globalAlpha=1;
   }
 }
+function cellSize(){ return Math.max(16,Math.min(64,target()*Z)); }
 function levelCell(e){
   const b=levelCv.getBoundingClientRect();
-  const T=slice.tw*Z;
-  const dx=Math.floor((e.clientX-b.left)/T), dy=Math.floor((e.clientY-b.top)/T);
+  const CS=cellSize();
+  const dx=Math.floor((e.clientX-b.left)/CS), dy=Math.floor((e.clientY-b.top)/CS);
   if(dx<0||dy<0||dx>=level.cols||dy>=level.rows) return null;
   return [dx,dy];
 }
@@ -252,8 +323,7 @@ function applyAt(dx,dy,erase){
   for(let bj=0;bj<brush.h;bj++)for(let bi=0;bi<brush.w;bi++){
     const x=dx+bi, y=dy+bj;
     if(x>=level.cols||y>=level.rows) continue;
-    const lr=level.rows-1-y;
-    level.cells[lr][x]=brush.cells[bj][bi];
+    level.cells[level.rows-1-y][x]=brush.cells[bj][bi];
   }
 }
 levelCv.addEventListener('contextmenu',e=>e.preventDefault());
@@ -279,12 +349,9 @@ addEventListener('keydown',e=>{ if((e.ctrlKey||e.metaKey)&&e.key==='z'){ $('undo
 $('fill').onclick=()=>{
   if(!brush) return;
   snapshot();
-  for(let lr=0;lr<level.rows;lr++)for(let c=0;c<level.cols;c++){
-    if(level.cells[lr][c]===null){
-      const i=brush.cells[lr%brush.h][c%brush.w];
-      level.cells[lr][c]=i;
-    }
-  }
+  for(let lr=0;lr<level.rows;lr++)for(let c=0;c<level.cols;c++)
+    if(level.cells[lr][c]===null)
+      level.cells[lr][c]=brush.cells[lr%brush.h][c%brush.w];
   drawLevel(); save();
 };
 $('resize').onclick=()=>{
@@ -298,21 +365,25 @@ $('resize').onclick=()=>{
 
 // ---------- export / import / autosave ----------
 function exportJSON(){
-  return JSON.stringify({format:'bc-level-1',
-    tile:{w:slice.tw,h:slice.th,gutter:slice.g,ox:slice.ox,oy:slice.oy},
-    sheetGrid:{cols:slice.cols,rows:slice.rows},
-    level:{cols:level.cols,rows:level.rows},
-    cells:level.cells});
+  return JSON.stringify({format:'bc-level-2', mode:gridMode,
+    boundsX,boundsY, target:target(),
+    level:{cols:level.cols,rows:level.rows}, cells:level.cells});
 }
 function importJSON(s){
   try{
     const j=JSON.parse(s);
-    if(j.format!=='bc-level-1') throw 0;
-    $('tw').value=j.tile.w; $('th').value=j.tile.h; $('gt').value=j.tile.gutter;
-    $('ox').value=j.tile.ox; $('oy').value=j.tile.oy;
+    if(j.format==='bc-level-2'){
+      boundsX=j.boundsX; boundsY=j.boundsY; gridMode=j.mode||'uniform';
+      $('tgt').value=j.target||32;
+      $('mode').textContent=gridMode==='bands'?'irregular bands':'uniform grid';
+    } else if(j.format==='bc-level-1'){
+      $('tw').value=j.tile.w; $('th').value=j.tile.h; $('gt').value=j.tile.gutter;
+      $('ox').value=j.tile.ox; $('oy').value=j.tile.oy;
+      uniformBounds();
+    } else throw 0;
     level.cols=j.level.cols; level.rows=j.level.rows; level.cells=j.cells;
     $('lc').value=level.cols; $('lr').value=level.rows;
-    readSlice(); drawSheet(); drawLevel();
+    drawSheet(); drawLevel();
   }catch(e){ alert('could not parse level JSON'); }
 }
 $('copy').onclick=()=>{
@@ -320,14 +391,12 @@ $('copy').onclick=()=>{
   try{ navigator.clipboard.writeText(s); }catch(e){ document.execCommand('copy'); }
 };
 $('load').onclick=()=>importJSON($('io').value);
-function save(){
-  try{ localStorage.setItem('bcLevelBuilder.autosave',exportJSON()); }catch(e){}
-}
+function save(){ try{ localStorage.setItem('bcLevelBuilder.v2',exportJSON()); }catch(e){} }
 $('restore').onclick=()=>{
-  try{ const s=localStorage.getItem('bcLevelBuilder.autosave'); if(s) importJSON(s); }catch(e){}
+  try{ const s=localStorage.getItem('bcLevelBuilder.v2'); if(s) importJSON(s); }catch(e){}
 };
 
-readSlice(); drawSheet(); drawLevel();
+uniformBounds(); drawSheet(); drawLevel();
 </script>
 </body>
 </html>
